@@ -1,0 +1,3 @@
+[submodule "ext_denoiser/denoiser"]
+	path = ext_denoiser/denoiser
+	url = https://github.com/eloimoliner/denoising-historical-recordings
