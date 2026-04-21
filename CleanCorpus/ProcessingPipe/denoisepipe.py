@@ -97,7 +97,6 @@ def denoise_audio(wav_path, noise_start, noise_end):
         prop_decrease   = 0.82,
         stationary      = False,
         n_fft           = 1024,
-        time_constant_s = 2.0,
       
     )
 
@@ -245,6 +244,8 @@ def process_nested_folders(base_in, base_out, detector):
     else:
         print(f"[ERROR] Nothing to process in {base_in}.")
 
+# ---------------------------------------------------------------------------
+# Entry Point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
