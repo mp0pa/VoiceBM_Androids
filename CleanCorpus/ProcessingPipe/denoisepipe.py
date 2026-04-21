@@ -3,244 +3,260 @@
 
 """Audacity batch audio denoising pipeline with automatic noise profile capture.
 
+    
 For each WAV file the pipeline:
   1. Detects breath/silence regions with Respiro-EN (no speech, background noise only).
-  2. Applies noise reduction (×2) in Python using the detected silence as the noise sample.
+  2. Applies noise reduction (×1) in Python using the detected silence as the noise sample.
   3. Imports the denoised file into Audacity and applies the remaining effects via the
      scripting pipe: stereo-to-mono, high-pass filter, noise gate, EQ curve, normalization.
   4. Exports the processed file as mono WAV.
 
 Requires Audacity to be running with mod-script-pipe enabled before launching.
+
+-------------------------
+Version 3, current: tweaked parameters from Maé's previous version (V2): 
+- steeper frequency tuning (README mentioned 90Hz, but apply_pipeline() was using 50Hz), moved RolloffType to DB24 for preserving formant quality & cut out mechanical rumble
+- slowed attack to 50ms (prevents clicks)
+- tuned gate to 350ms (previously at 100) to prevent chopping in-between sentence silent pauses
+- lowered sensitivity tuning at 0.05 (previously 0.064) for faint backround noise in find_noise_profile_segment() & increased min_lenght to 250ms for a slightly better reduction of bird chirping(from 20, now min_lenght = 25 and also removed the imposed MIN_SILENCE_DURATION)
+- denoise_audio() now has:
+    prop_decrease: spectral subtraction of a 0.82 ratio (prevents clicky-sounding artifacts)
+    stationary=False: adaptive tracking so the algo can adjust to noise varying in frequency (wind, humming etc)
+    n_fft = 1024: finer freq bins for voice separation
+- do_command() improved for error handling & prevents the script from hanging if audacity is frozen (deadline timer timeout at 10sec to kill processes if failing to respond)
+   
 """
 
 import os
 import sys
 import tempfile
 import time
-
+import errno
+import glob
 import noisereduce as nr
 import soundfile as sf
 import torch
 
 # ---------------------------------------------------------------------------
-# Respiro-EN – automatic silence / breath detection
+# Path Configuration (Dynamic & Safe)
 # ---------------------------------------------------------------------------
-RESPIRO_PATH = "/PATH/HERE/Respiro-en"
-sys.path.insert(0, RESPIRO_PATH)
+SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR      = os.path.abspath(os.path.join(SCRIPT_DIR, "../../.."))
+RESPIRO_PATH  = os.path.join(ROOT_DIR, "Respiro-en")
 
-from modules import DetectionNet, BreathDetector  # noqa: E402
+if os.path.exists(RESPIRO_PATH):
+    sys.path.insert(0, RESPIRO_PATH)
+else:
+    print(f"ERROR: Respiro path not found at: {RESPIRO_PATH}")
+    sys.exit(1)
 
-# Minimum duration (seconds) a detected silence must have to be used as the
-# noise-profile source.  Intervals shorter than this are ignored; if none
-# qualify the pipeline falls back to the first 0.5 s of the file.
-MIN_SILENCE_DURATION = 0.3
+from modules import DetectionNet, BreathDetector
 
+# ---------------------------------------------------------------------------
+# Breath Detection & Denoising Logic
+# ---------------------------------------------------------------------------
 
 def init_breath_detector():
-    """Load the Respiro-EN model once for the whole session.
-
-    Returns a ready-to-call BreathDetector instance.
-    """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load(
-        os.path.join(RESPIRO_PATH, "respiro-en.pt"),
-        map_location=device,
-        weights_only=False,
-    )
-    model = DetectionNet().to(device)
+    #Gemini's suggestion: GPU ACCELERATION: AUTOMATICALLY DETECTS CUDA TO SPEED UP NEURAL NETWORK INFERENCE ON SUPPORTED HARDWARE
+    device          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint_file = os.path.join(RESPIRO_PATH, "respiro-en.pt")
+    checkpoint      = torch.load(checkpoint_file, map_location=device, weights_only=False)
+    model           = DetectionNet().to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
-    print(f"Respiro-EN loaded on {device}.")
+    print(f"Respiro-EN Model Loaded on {device}")
     return BreathDetector(model, device=device)
 
-
-def find_noise_profile_segment(detector, wav_path, min_duration=MIN_SILENCE_DURATION):
-    """Return (start, end) in seconds of the best silence for noise profiling.
-
-    Uses Respiro-EN to find breath / pause intervals (non-speech regions that
-    carry background noise).  The longest qualifying interval is chosen so that
-    the noise reduction has the most representative noise sample.
-
-    Falls back to the first 0.5 s of the file when:
-      - Respiro-EN detects no intervals, or
-      - all detected intervals are shorter than *min_duration*, or
-      - an error occurs during detection.
-    """
+def find_noise_profile_segment(detector, wav_path):
+  
     try:
-        tree = detector(wav_path, threshold=0.064, min_length=20)
+        tree = detector(wav_path, threshold=0.05, min_length=25)
         if tree:
             best = max(sorted(tree), key=lambda iv: iv.end - iv.begin)
-            if (best.end - best.begin) >= min_duration:
-                return best.begin, best.end
-    except Exception as exc:
-        print(f"    [Respiro-EN] Detection failed ({exc}); using fallback segment.")
-
-    # Fallback: the very beginning of the file typically contains room tone
-    # before the speaker starts talking.
+            return best.begin, best.end
+    except Exception as e:
+        print(f"      Detection hint: {e}")
     return 0.0, 0.5
 
-
-# ---------------------------------------------------------------------------
-# Python-based noise reduction
-# ---------------------------------------------------------------------------
-
 def denoise_audio(wav_path, noise_start, noise_end):
-    """Apply two-pass noise reduction in Python and return the path to a temp WAV.
 
-    Loads *wav_path*, extracts the silence segment [noise_start, noise_end] as
-    the noise profile, and runs noisereduce twice (matching the original
-    double-pass Audacity macro).  Writes the result to a temporary WAV file
-    and returns its path.  The caller is responsible for deleting the temp file.
+    data, sr  = sf.read(wav_path)
+    audio     = data.T if data.ndim > 1 else data
 
-    noisereduce expects shape (channels, samples) for multichannel audio.
-    soundfile reads shape (samples, channels), so we transpose before and after.
-    """
-    data, sr = sf.read(wav_path)
+    s_idx = int(noise_start * sr)
+    e_idx = int(noise_end   * sr)
+    if e_idx - s_idx < 100:
+        e_idx = s_idx + 1000
 
-    # Transpose to (channels, samples) if stereo, keep 1-D if already mono.
-    multichannel = data.ndim > 1
-    if multichannel:
-        audio = data.T  # (channels, samples)
-        noise_sample = audio[:, int(noise_start * sr):int(noise_end * sr)]
-    else:
-        audio = data
-        noise_sample = audio[int(noise_start * sr):int(noise_end * sr)]
+    noise_sample = audio[:, s_idx:e_idx] if data.ndim > 1 else audio[s_idx:e_idx]
 
-    # Two denoising passes.
-    reduced = nr.reduce_noise(y=audio, sr=sr, y_noise=noise_sample)
-    reduced = nr.reduce_noise(y=reduced, sr=sr, y_noise=noise_sample)
+    reduced = nr.reduce_noise(
+        y               = audio,
+        sr              = sr,
+        y_noise         = noise_sample,
+        prop_decrease   = 0.82,
+        stationary      = False,
+        n_fft           = 1024,
+        time_constant_s = 2.0,
+      
+    )
 
-    # Transpose back to (samples, channels) for soundfile.
-    if multichannel:
-        reduced = reduced.T
-
+    reduced = reduced.T if data.ndim > 1 else reduced
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     sf.write(tmp.name, reduced, sr)
     return tmp.name
 
+# ---------------------------------------------------------------------------
+# Audacity pipe setup - cross-platform
+# ---------------------------------------------------------------------------
+
+def get_pipes():
+    """Finds Audacity pipes for Windows, Linux, or macOS."""
+    if sys.platform == 'win32':
+        toname = "\\\\.\\pipe\\audacity_script_pipe.to"
+        fromname = "\\\\.\\pipe\\audacity_script_pipe.from"
+        return (toname, fromname) if os.path.exists(toname) else (None, None)
+    else:
+        to_pipes = glob.glob("/tmp/audacity_script_pipe.to.*")
+        from_pipes = glob.glob("/tmp/audacity_script_pipe.from.*")
+        if not to_pipes or not from_pipes:
+            return None, None
+        return sorted(to_pipes)[-1], sorted(from_pipes)[-1]
+#changed function to prevent the script running indefinitely if encountering dialog boxes
+def do_command(command, timeout=10):
+    """Sends command to Audacity and waits for response with improved polling."""
+    POLL_INTERVAL = 0.5   
+    PIPE_TIMEOUT  = 8.0   
+    deadline = time.time() + PIPE_TIMEOUT
+    fd = None
+
+    while time.time() < deadline:
+        toname, fromname = get_pipes()
+        if toname and fromname:
+            try:
+                fd = os.open(toname, os.O_WRONLY | os.O_NONBLOCK)
+                break
+            except (FileNotFoundError, OSError):
+                pass 
+        time.sleep(POLL_INTERVAL)
+
+    if fd is None:
+        print("!!! Audacity pipe not found. Is Audacity open with mod-script-pipe enabled?")
+        sys.exit(1)
+
+    with os.fdopen(fd, 'w') as to_pipe:
+        to_pipe.write(command + "\n")
+        to_pipe.flush()
+
+    # Read response
+    _, fromname = get_pipes()
+    from_fd  = os.open(fromname, os.O_RDONLY | os.O_NONBLOCK)
+    read_deadline = time.time() + timeout
+    with os.fdopen(from_fd, 'r') as from_pipe:
+        partial = ""
+        while time.time() < read_deadline:
+            try:
+                chunk = from_pipe.read(4096)
+                if chunk:
+                    partial += chunk
+                    if partial.endswith("\n\n"): break
+            except BlockingIOError:
+                time.sleep(0.05)
+    return partial.strip()
 
 # ---------------------------------------------------------------------------
-# Audacity pipe setup
+# Processing either single file/flat directories/nested directories
 # ---------------------------------------------------------------------------
-if sys.platform == "win32":
-    TONAME = "\\\\.\\pipe\\ToSrvPipe"
-    FROMNAME = "\\\\.\\pipe\\FromSrvPipe"
-    EOL = "\r\n\0"
-elif sys.platform == "darwin":
-    TONAME = "/tmp/audacity_script_pipe.to." + str(os.getuid())
-    FROMNAME = "/tmp/audacity_script_pipe.from." + str(os.getuid())
-    EOL = "\n"
-else:  # Linux
-    TONAME = "/tmp/audacity_script_pipe.to." + str(os.getuid())
-    FROMNAME = "/tmp/audacity_script_pipe.from." + str(os.getuid())
-    EOL = "\n"
 
-if not os.path.exists(TONAME):
-    print(f"{TONAME} ..does not exist.  Ensure Audacity is running with mod-script-pipe.")
-    sys.exit()
-if not os.path.exists(FROMNAME):
-    print(f"{FROMNAME} ..does not exist.  Ensure Audacity is running with mod-script-pipe.")
-    sys.exit()
+def process_single_file(input_path, output_path, detector):
+ 
+    if not input_path.lower().endswith(".wav"):
+        return
 
-TOFILE = open(TONAME, "w")
-FROMFILE = open(FROMNAME, "rt")
+    # Clean up existing output to prevent Audacity "Overwrite" dialogs
+    if os.path.exists(output_path):
+        try:
+            os.remove(output_path)
+        except OSError:
+            print(f"  [ERROR] Cannot delete existing file: {output_path}.")
+            return
 
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-def send_command(command):
-    """Send a single command to Audacity."""
-    TOFILE.write(command + EOL)
-    TOFILE.flush()
+    # 1.Respiro breath detection + noisereduce
+    start, end = find_noise_profile_segment(detector, input_path)
+    print(f"  [Denoise] {os.path.basename(input_path)}  profile: {start:.2f}s → {end:.2f}s")
+    tmp_wav = denoise_audio(input_path, start, end)
 
+    # 2.Audacity chain
+    do_command(f'Import2: Filename="{tmp_wav}"')
+    do_command("SelectAll:")
+    do_command("StereoToMono:")
+    do_command("SelectAll:")
+    do_command('High-passFilter: Frequency=50 RolloffType="dB42"')
+    do_command('NoiseGate: ATTACK="50" DECAY="350" HOLD="150" LEVEL-REDUCTION="-24" THRESHOLD="-42"')
+    do_command('Normalize: ApplyVolume="1" PeakLevel="-1" RemoveDcOffset="1"')
+    do_command(f'Export2: Filename="{output_path}" NumChannels=1')
+    do_command("RemoveTracks:")
 
-def get_response():
-    """Read and return Audacity's response to the last command."""
-    result = ""
-    line = ""
-    while True:
-        result += line
-        line = FROMFILE.readline()
-        if line == "\n" and len(result) > 0:
-            break
-    return result
-
-
-def do_command(command):
-    """Send one command and return the response."""
-    send_command(command)
-    response = get_response()
-    print(f"[cmd] {command!r}  →  {response.strip()!r}")
-    return response
-
-
-# ---------------------------------------------------------------------------
-# Directory configuration – update these to match your local paths
-# ---------------------------------------------------------------------------
-in_dir = "/PATH/HERE/Downloads/Androids-Corpus/HC"
-out_dir = "/PATH/HERE/Downloads/Androids-Corpus/HC_ok"
-
-filenames = [f for f in os.listdir(in_dir) if f.lower().endswith(".wav")]
-
-
-# ---------------------------------------------------------------------------
-# Pipeline
-# ---------------------------------------------------------------------------
-def apply_pipeline(filenames, in_dir, out_dir, detector):
-    """Process every WAV file through the full denoising pipeline.
-
-    For each file:
-      1. Find the best silence segment with Respiro-EN.
-      2. Apply two-pass noise reduction in Python (noisereduce).
-      3. Import the denoised temp file into Audacity.
-      4. Apply the remaining effects via the scripting pipe:
-           StereoToMono → High-pass filter → Noise gate → EQ curve → Normalize.
-      5. Export as mono WAV and remove the track.
-    """
-    # Disable undo history to prevent Audacity from slowing down across files.
-    do_command("SetPreference: Name=GUI/MaxUndoLevels Value=0 Reload=0")
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 100:
+        print(f"  [OK]  {os.path.basename(output_path)} ({os.path.getsize(output_path):,} bytes)")
     
-    for f in filenames:
-        input_path = os.path.abspath(os.path.join(in_dir, f))
-        output_path = os.path.abspath(os.path.join(out_dir, f))
+    if os.path.exists(tmp_wav):
+        os.unlink(tmp_wav)
+    time.sleep(0.1)
 
-        print(f"\n--- Processing: {f} ---")
+def process_nested_folders(base_in, base_out, detector):
+    """
+    Auto-detection of flat vs nested layouts.
+    Nested Mode: each speaker subfolder processed separately to prevent collisions.
+    """
+    if os.path.isfile(base_in):
+        process_single_file(base_in, base_out, detector)
+        return
 
-        # Step 1 – find noise segment.
-        start, end = find_noise_profile_segment(detector, input_path)
-        print(f"    Noise profile segment: {start:.3f}s – {end:.3f}s")
+    if not os.path.isdir(base_in):
+        print(f"[ERROR] Input directory not found: {base_in}")
+        return
 
-        # Select only the silence segment and tell Audacity to learn the noise profile
-        
-        # "Get Noise Profile" step command isn't actually recognized by audacity, see 4
-        # Maé's version can be debugged by changing the above command to 4, everything else would be the same
-        
-        # Dropped the macro altogether and applied it as a set of separate instructions
-        do_command("SelectAll:")
-        do_command('StereoToMono:')
+    entries = os.listdir(base_in)
+    subdirs = [e for e in entries if os.path.isdir(os.path.join(base_in, e))]
+    root_wavs = [e for e in entries if e.lower().endswith(".wav")]
+    
+    #FLAT MODE: WAVs live directly in base_in ──────────────────────────
+    if root_wavs and not subdirs:
+        print(f"--- Flat layout detected ({len(root_wavs)} WAV file(s) at root) ---")
+        folder_name = os.path.basename(base_in.rstrip("/"))
+        out_dir = os.path.join(base_out, f"{folder_name}ok")
+        for f in sorted(root_wavs):
+            out_path = os.path.join(out_dir, f.replace(".wav", "ok.wav"))
+            process_single_file(os.path.join(base_in, f), out_path, detector)
 
-        # 2. High-pass filter
-        do_command('Auhighshelffilter:FREQUENCY="90" ROLLOFF="dB12"')
+    #NESTED MODE, for IT: subdirectories hold the recordings ───────────────────
+    elif subdirs:
+        print(f"--- Nested layout detected: {len(subdirs)} subfolder(s) ---")
+        for sub in sorted(subdirs):
+            in_subdir = os.path.join(base_in, sub)
+            out_subdir = os.path.join(base_out, f"{sub}ok")
+            for f in sorted(os.listdir(in_subdir)):
+                if f.lower().endswith(".wav"):
+                    out_path = os.path.join(out_subdir, f.replace(".wav", "ok.wav"))
+                    process_single_file(os.path.join(in_subdir, f), out_path, detector)
+    else:
+        print(f"[ERROR] Nothing to process in {base_in}.")
 
-        # 3. Noise gate
-        do_command('NoiseGate: ATTACK="10" DECAY="100" GATE-FREQ="0" HOLD="50" LEVEL-REDUCTION="-24" MODE="Gate" STEREO-LINK="LinkStereo" THRESHOLD="-40"')
+# ---------------------------------------------------------------------------
 
-        # 4. Noise reduction (uses profile captured above)
-        do_command("NoiseReduction: Action=Apply")
+if __name__ == "__main__":
+    #PATHS HERE: set these to match your corpus directory
+    IN_PATH  = "/Users/mpopa/Downloads/Androids-Corpus/Interview-Task/audio_cliptestcopie"
+    OUT_PATH = "/Users/mpopa/Downloads/Androids-Corpus/Interview-Task/audio_cliptestcopieok"
 
-        # 5. Filter curve EQ
-        do_command('FilterCurve: f0="67.516154" f1="94.215554" f2="101.80691" f3="120.73062" f4="963.29991" f5="2011.3169" f6="3652.7602" f7="6633.7916" f8="10080.842" f9="13324.579" f10="14398.197" f11="15558.322" f12="18593.811" f13="19328.392" f14="20091.994" f15="20405.816" f16="20885.763" FilterLength="8191" InterpolateLin="0" InterpolationMethod="B-spline" v0="-18.42572" v1="-3.3924615" v2="-1.1308193" v3="-0.066518784" v4="1.1308211" v5="1.1308211" v6="1.2638587" v7="0.066518784" v8="-0.33259392" v9="-0.066518784" v10="-2.1951234" v11="-4.0576496" v12="-5.7871413" v13="-8.0487804" v14="-9.379159" v15="-12.305985" v16="-14.966741"')
+    if not os.path.exists(IN_PATH):
+        print(f"Input path not found: {IN_PATH}")
+        sys.exit(1)
 
-        # 6. Normalize
-        do_command('Normalize: ApplyVolume="1" PeakLevel="-1" RemoveDcOffset="1" StereoIndependent="0"')
-
-        do_command(f'Export2: Filename="{output_path}" NumChannels=1')
-        do_command("SelectAll:")
-        do_command("RemoveTracks:")
-        time.sleep(0.1)
-       
-
-    # Restore undo history to its default after the batch.
-    do_command("SetPreference: Name=GUI/MaxUndoLevels Value=10 Reload=0")
-
-
-detector = init_breath_detector()
-apply_macro(filenames, in_dir, out_dir, detector)
+    print("--- Starting Denoise Pipeline v3 ---")
+    detector = init_breath_detector()
+    process_nested_folders(IN_PATH, OUT_PATH, detector)
+    print("\n--- Denoising completed ---")
