@@ -4,6 +4,15 @@ Batch audio denoising and enhancement pipeline that processes WAV files through 
 
 The noise profile required for noise reduction is captured **automatically** for each file: the pipeline uses [Respiro-EN](https://github.com/keums/respiro-en) to detect breath / silence regions in the audio, selects the best one, and feeds it to `noisereduce` as the noise sample — no manual profile capture needed.
 
+The pipeline features **automatic layout detection**, supporting single files, flat directories, and nested speaker subdirectories (Interview Task style).
+
+## New in Version 3 (v3)
+- **GPU Acceleration**: Automatically detects and uses CUDA for faster neural network inference.
+- **Robust Error Handling**: Improved pipe logic with a 10s watchdog timer to prevent script hangs during Audacity freezes.
+- **Tuned Audio Chain**: Optimized for bird-chirp rejection and preserving vocal formants.
+- **Pre-emptive Cleanup**: Automatically deletes existing output files to prevent Audacity "Overwrite" dialog blocks.
+- **Added function for the subfolders in Interview Task**: if the input directory has subfolders, it now iterates through each of them, process its audios and recreate the structure in the output directory of the cleaned files.
+
 ## Prerequisites
 
 - **Audacity** with the `mod-script-pipe` module enabled
@@ -22,13 +31,15 @@ The noise profile required for noise reduction is captured **automatically** for
 ## Project Structure
 
 ```
+InterviewTaskok/
 ProcessingPipe/
-├── denoisepipe.py          # Main script: batch denoising and Audacity effects
+├── denoisepipe.py          # Main script, v3: batch denoising and Audacity effects
 ├── denoisemetrics.py       # Metrics script: PESQ / SI-SAR / STOI evaluation
 ├── AudacityMacros/
 │   ├── Denoiseok.txt       # Reference macro (documents the processing chain; not used at runtime)
 │   ├── GetProfile.txt      # Reference macro (documents the noise profile step; not used at runtime)
 │   └── Join.txt            # Track joining macro (utility, run manually in Audacity)
+|── ReadingTaskok/
 └── README.md
 ```
 
@@ -41,10 +52,8 @@ The pipeline communicates with a running Audacity instance through named pipes. 
 1. Runs **Respiro-EN** to detect breath/silence intervals (non-speech regions that carry background noise)
 2. Picks the **longest qualifying silence** as the noise sample source
 3. Applies **single-pass noise reduction in Python** (`noisereduce`) using the detected silence as the noise profile
-4. Writes the denoised audio to a temporary WAV file
-5. Imports the temp file into Audacity and applies the remaining effects via the scripting pipe: stereo-to-mono, high-pass filter, noise gate, EQ curve, normalization
-6. Exports the processed audio as mono WAV to the output directory
-7. Removes the track from Audacity and deletes the temp file
+4. Executes the Audacity effect chain via the scripting pipe.
+5. Exports the processed file as a mono WAV and cleans up temporary tracks.
 
 ### Why noise reduction is done in Python, not in Audacity
 
@@ -72,11 +81,11 @@ Open `denoisepipe.py` and update the two directory constants:
 
 ```python
 in_dir  = "/path/to/input/audio"
-out_dir = "/path/to/output/audio"
+out_dir = "/path/to/output/audiook"
 ```
 
 - `in_dir` — directory containing the `.wav` files to process
-- `out_dir` — directory where cleaned files will be saved (must already exist)
+- `out_dir` — directory where cleaned files will be saved (must already exist, add a "ok" tag in the filename)
 
 ## Running the Pipeline
 
@@ -89,26 +98,22 @@ python denoisepipe.py
 
 The script logs each file, the silence segment used for noise profiling, and each Audacity command. All output files keep their original filenames and are written to `out_dir` as mono WAV.
 
-## Processing Chain Reference
+### Processing Chain Reference (v3)
 
-The pipeline applies the following steps in order:
-
-| Step | Where | Effect | Key Parameters | Purpose |
-|------|--------|--------|---------------|---------|
-| 1 | Python | Noise Reduction | `noisereduce` defaults | Reduce background noise using the silence profile |
-| 2 | Audacity | StereoToMono | — | Convert to single channel |
-| 3 | Audacity | High-Pass Filter | Frequency=50 Hz, Rolloff=12 dB/oct | Remove low-frequency rumble |
-| 4 | Audacity | Noise Gate | Threshold=-40 dB, Level-Reduction=-24 dB, Attack=10 ms, Decay=100 ms, Hold=50 ms | Gate out residual low-level noise in silent sections |
-| 5 | Audacity | Filter Curve (EQ) | 17-point B-spline curve, 67 Hz – 20.8 kHz | Shape frequency response for speech clarity |
-| 6 | Audacity | Normalize | Peak Level=-1 dB, Remove DC Offset=yes | Normalize volume, prevent clipping |
+| Step | Where | Effect | Parameters | Purpose |
+|------|--------|--------|------------|---------|
+| 1 | Python | Noise Reduction | `prop_decrease=0.82`, `stationary=False`, `n_fft=1024` | Adaptive reduction to handle varying noise (wind, hum). |
+| 2 | Audacity | StereoToMono | — | Convert to single channel. |
+| 3 | Audacity | High-Pass Filter | **50 Hz / dB42 Rolloff** | Extreme low-end cut to remove mechanical rumble. |
+| 4 | Audacity | Noise Gate | **Attack=50ms, Decay=350ms**, Hold=150ms, Thr=-42dB | Prevents clicking and "choppy" speech during pauses. |
+| 5 | Audacity | Normalize | Peak Level=-1 dB | Maximizes volume without clipping. |
 
 ### Automatic noise profile capture (Respiro-EN)
 
 For each file the pipeline calls `find_noise_profile_segment()`, which:
 
-1. Runs `BreathDetector` (Respiro-EN) on the raw WAV file at a threshold of `0.064` and a minimum segment length of 20 frames (200 ms)
-2. Picks the **longest detected interval** that is at least `MIN_SILENCE_DURATION` (default 0.3 s)
-3. Returns `(start, end)` in seconds
+- **Threshold**: `0.05` (Higher sensitivity for faint background noise).
+- **Min Length**: `25` frames (250ms) to better filter out short transients like bird chirps.
 
 The identified segment is passed to `denoise_audio()`, which extracts the corresponding samples as the noise profile for `noisereduce`.
 
@@ -132,40 +137,24 @@ In `denoisepipe.py`:
 |---------------------|---------|-----------------|
 | `RESPIRO_PATH` | (path to Respiro-en) | Location of the Respiro-EN directory |
 | `MIN_SILENCE_DURATION` | `0.3` s | Shortest interval accepted as a noise sample; increase for a stricter selection |
-| `threshold` in `find_noise_profile_segment` | `0.064` | Respiro-EN detection threshold — lower values detect more (possibly shorter) breath regions |
-| `min_length` in `find_noise_profile_segment` | `20` frames (200 ms) | Minimum frame run that counts as a detected breath interval |
+| `threshold` in `find_noise_profile_segment` | `0.05` | Respiro-EN detection threshold — lower values detect more (possibly shorter) breath regions |
+| `min_length` in `find_noise_profile_segment` | `25` frames (250 ms) | Minimum frame run that counts as a detected breath interval |
 
 ### Noise reduction strength
 
 `noisereduce` is called with default parameters. To adjust aggressiveness, pass extra arguments to `nr.reduce_noise()` in `denoise_audio()`:
 
-```python
-# More aggressive reduction
-reduced = nr.reduce_noise(y=audio, sr=sr, y_noise=noise_sample, prop_decrease=1.0, stationary=False)
-```
-
 Key parameters:
 
 | Parameter | Default | What it controls |
 |-----------|---------|-----------------|
-| `prop_decrease` | `1.0` | Proportion of noise to reduce (0–1). Lower for gentler reduction. |
+| `prop_decrease` | `0.82` | Proportion of noise to reduce (0–1). Lower for gentler reduction. |
 | `stationary` | `False` | `True` assumes noise is constant; `False` adapts over time |
-| `n_std_thresh_stationary` | `1.5` | Sensitivity threshold for stationary mode |
-
-### Audacity effect parameters
-
-The Audacity pipe commands and their parameters are set directly in `apply_pipeline()` in `denoisepipe.py`. Key values:
-
-| Parameter | Location in code | Default | What it controls |
-|-----------|-----------------|---------|-----------------|
-| High-pass frequency | `High-passFilter:` call | `90` Hz | Cutoff for low-frequency removal |
-| High-pass rolloff | `High-passFilter:` call | `dB12` | Filter steepness. Options: `dB6`, `dB12`, `dB24`, `dB36`, `dB48` |
-| Noise gate threshold | `NoiseGate:` call | `-40` dB | Level below which the gate closes |
+| Noise gate threshold | `NoiseGate:` call | `-42` dB | Level below which the gate closes |
 | Noise gate level reduction | `NoiseGate:` call | `-24` dB | Attenuation when the gate is closed |
-| Noise gate attack | `NoiseGate:` call | `10` ms | How fast the gate opens |
-| Noise gate decay | `NoiseGate:` call | `100` ms | How fast the gate closes |
+| Noise gate attack | `NoiseGate:` call | `50` ms | How fast the gate opens |
+| Noise gate decay | `NoiseGate:` call | `350` ms | How fast the gate closes |
 | Noise gate hold | `NoiseGate:` call | `50` ms | Minimum open time |
-| EQ curve points | `FilterCurve:` call | (17 points, 67 Hz–20.8 kHz) | `f0`–`f16` = frequencies in Hz, `v0`–`v16` = gain in dB |
 | Normalization peak | `Normalize:` call | `-1` dB | Target peak amplitude |
 
 ### Changing Output Channels
