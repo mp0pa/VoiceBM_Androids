@@ -82,6 +82,11 @@ def denoise_audio(wav_path, noise_start, noise_end):
 
     data, sr  = sf.read(wav_path)
     audio     = data.T if data.ndim > 1 else data
+    """Apply single-pass noise reduction in Python and return the path to a temp WAV.
+
+    Loads *wav_path*, extracts the silence segment [noise_start, noise_end] as
+    the noise profile, and runs noisereduce once.  Writes the result to a temporary WAV file
+    and returns its path.  The caller is responsible for deleting the temp file.
 
     s_idx = int(noise_start * sr)
     e_idx = int(noise_end   * sr)
