@@ -5,3 +5,5 @@ Icon
 ._*
 .Spotlight-V100
 .Trashes
+env/
+ext_denoiser/
