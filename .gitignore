@@ -7,3 +7,6 @@ Icon
 .Trashes
 env/
 ext_denoiser/
+IT/
+RT/
+.vscode/
