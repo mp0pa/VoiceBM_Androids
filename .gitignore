@@ -10,3 +10,6 @@ ext_denoiser/
 IT/
 RT/
 .vscode/
+*.pt
+*.pth
+timestamps_*.csv
