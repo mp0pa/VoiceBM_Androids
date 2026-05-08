@@ -1,3 +1,0 @@
-[submodule "feature_extraction/Respiro-en"]
-	path = feature_extraction/segmentation/Respiro-en
-	url = https://github.com/ydqmkkx/Respiro-en.git
