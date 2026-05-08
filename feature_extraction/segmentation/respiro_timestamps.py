@@ -1,14 +1,15 @@
 import os
 import sys
 import csv
+import argparse
 import torch
 import librosa
 import numpy as np
 from pathlib import Path
 
-# Access Respiro-en code and model weights
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-RESPIRO_PATH = os.path.join(SCRIPT_DIR, "Respiro-en")
+# Configure the path to your local Respiro-en installation
+# UPDATE THIS to match your local setup before running the script
+RESPIRO_PATH = "/home/monicapsq/Desktop/Respiro-en"
 
 # Ensure Respiro-en path is valid before importing modules
 if os.path.exists(RESPIRO_PATH):
@@ -33,7 +34,7 @@ min_length = 20
 frame_duration = 0.01  # 1 frame = 10ms for respiro-en feature_extractor stride
 
 # Function to process a directory of .wav files and extract timestamps
-def process_directory(directory_path, output_csv):
+def process_directory(directory_path, output_dir):
     # Find all .wav files recursively (handles both flat RT and nested IT structures)
     wav_files = [p for p in Path(directory_path).rglob('*') if p.suffix.lower() == '.wav']
     
@@ -42,6 +43,10 @@ def process_directory(directory_path, output_csv):
         return
 
     print(f"Found {len(wav_files)} files in {directory_path}. Processing...")
+
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    output_csv = out_path / "timestamps.csv"
 
     with open(output_csv, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -75,17 +80,15 @@ def process_directory(directory_path, output_csv):
             except Exception as e:
                 print(f"Error processing {wav_path}: {e}")
 
-# Configure paths relative to the folder where you run the script:
-directories_to_process = [
-    ('IT', 'IT'),
-    ('RT', 'RT'),
-    ('ITok', 'CleanCorpus/InterviewTaskok'),
-    ('RTok', 'CleanCorpus/ReadingTaskok'),
-]
-
-for label, folder_path in directories_to_process:
-    if os.path.exists(folder_path):
-        process_directory(folder_path, f'timestamps_{label}.csv')
-        print(f"Saved timestamps for {label} to timestamps_{label}.csv")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Extract breath timestamps from audio files using Respiro-en.")
+    parser.add_argument("input_dir", type=str, help="Directory containing the input .wav files")
+    parser.add_argument("output_dir", type=str, help="Directory to save the output timestamps.csv file")
+    
+    args = parser.parse_args()
+    
+    if os.path.exists(args.input_dir):
+        process_directory(args.input_dir, args.output_dir)
+        print(f"Finished processing. Saved timestamps to {Path(args.output_dir) / 'timestamps.csv'}")
     else:
-        print(f"WARNING: Directory '{folder_path}' not found. Skipping...")
+        print(f"ERROR: Directory '{args.input_dir}' not found.")
