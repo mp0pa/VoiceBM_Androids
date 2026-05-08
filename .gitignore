@@ -7,3 +7,7 @@ Icon
 .Trashes
 env/
 ext_denoiser/
+.vscode/
+*.pt
+*.pth
+recordings/

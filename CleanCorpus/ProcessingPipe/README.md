@@ -2,7 +2,7 @@
 
 Batch audio denoising and enhancement pipeline that processes WAV files through a combination of Python (noise reduction) and Audacity via its scripting interface (`mod-script-pipe`).
 
-The noise profile required for noise reduction is captured **automatically** for each file: the pipeline uses [Respiro-EN](https://github.com/keums/respiro-en) to detect breath / silence regions in the audio, selects the best one, and feeds it to `noisereduce` as the noise sample — no manual profile capture needed.
+The noise profile required for noise reduction is captured **automatically** for each file: the pipeline uses [Respiro-EN](https://github.com/ydqmkkx/Respiro-en) to detect breath / silence regions in the audio, selects the best one, and feeds it to `noisereduce` as the noise sample — no manual profile capture needed.
 
 The pipeline features **automatic layout detection**, supporting single files, flat directories, and nested speaker subdirectories (Interview Task style).
 
