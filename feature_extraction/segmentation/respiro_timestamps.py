@@ -9,7 +9,7 @@ from pathlib import Path
 
 # Configure the path to your local Respiro-en installation
 # UPDATE THIS to match your local setup before running the script
-RESPIRO_PATH = "/home/monicapsq/Desktop/Respiro-en"
+RESPIRO_PATH = "/path/to/Respiro-en"
 
 # Ensure Respiro-en path is valid before importing modules
 if os.path.exists(RESPIRO_PATH):
