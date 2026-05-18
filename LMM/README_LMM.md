@@ -81,11 +81,11 @@ When a row is created for a given condition, all other condition columns are fil
 
 ##### `wav_to_mp3(folder_paths, output_dir, bitrate)`
 
-Converts every `.wav` file found in a list of folders to `.mp3` and saves them to `output_dir`.
+Converts every `.wav` file found recursively under a list of **mother folders** to `.mp3` and saves them to `output_dir`.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `folder_paths` | `list[str]` | Folders containing `.wav` files |
+| `folder_paths` | `list[str]` | Mother folders to walk recursively for `.wav` files (e.g. the segmented speaker parent folder — all speaker sub-folders are processed automatically) |
 | `output_dir` | `str` | Destination folder for converted `.mp3` files (default: `"mp3_converted"`) |
 | `bitrate` | `str` | MP3 bitrate, e.g. `"128k"` (default: `"128k"`) |
 
@@ -124,8 +124,8 @@ Condition column set: `compression` → `"mp3"` or `"wav"`.
 | Parameter | Type | Description |
 |---|---|---|
 | `csv_path` | `str` | Main CSV to enrich (saved in place) |
-| `mp3_folder_paths` | `list[str]` | Folders containing `.mp3` files |
-| `f0_csv_folder_paths` | `list[str]` | Speaker folders with `mean/`, `standard_dev/`, `variance/` sub-folders holding pre-computed per-utterance F0 stats from `.wav` files |
+| `mp3_folder_paths` | `list[str]` | Folders to search recursively for `.mp3` files |
+| `f0_csv_folder_paths` | `list[str]` | **Mother folders** each containing speaker sub-folders that hold `mean/`, `standard_dev/`, `variance/` sub-folders with pre-computed per-utterance F0 stats from `.wav` files (e.g. `F0_results_IT/`) |
 
 ---
 
@@ -141,8 +141,8 @@ Condition column set: `dataset_size` → `"halved"` or `"full"`.
 | Parameter | Type | Description |
 |---|---|---|
 | `csv_path` | `str` | Main CSV to enrich (saved in place) |
-| `halved_folder_paths` | `list[str]` | Folders containing per-utterance halved frame-level F0 CSVs (`Start_Time`, `End_Time`, `F0_Hz`) |
-| `f0_csv_folder_paths` | `list[str]` | Speaker folders with `mean/`, `standard_dev/`, `variance/` sub-folders for the full dataset |
+| `halved_folder_paths` | `list[str]` | Folders to search recursively for per-utterance halved frame-level F0 CSVs (`Start_Time`, `End_Time`, `F0_Hz`) — returned by `halve_csv_files` |
+| `f0_csv_folder_paths` | `list[str]` | **Mother folders** each containing speaker sub-folders that hold `mean/`, `standard_dev/`, `variance/` sub-folders with pre-computed F0 stats from the full dataset (e.g. `F0_results_IT/`) |
 
 ---
 
@@ -210,41 +210,43 @@ Orchestrates the full pipeline and produces the final 9-column LMM CSV.
 
 ### How to run the pipeline
 
+All folder path parameters accept **mother folders** — provide a single parent directory and the pipeline discovers all speaker sub-folders and files automatically.
+
 ```python
 from verification_prep_data import main
 
 main(
     output_csv="lmm_verification.csv",
 
-    # Original .wav utterances (used as utterance list and for wav→mp3 conversion)
+    # Mother folder containing all speaker segmented sub-folders with .wav files
+    # e.g. segmented_IT/IT_01_CF56_1_segmented/*.wav, segmented_IT/IT_02_CM57_2_segmented/*.wav ...
     wav_folder_paths=[
-        "feature_extraction/AndroidsResults/segmented/IT_01_CF56_1_segmented",
-        "feature_extraction/AndroidsResults/segmented/IT_02_CM57_2_segmented",
+        "feature_extraction/AndroidsResults/segmented_IT",
     ],
 
     # Where to store converted .mp3 files
     mp3_output_dir="LMM/mp3_converted",
 
-    # Pre-computed F0 stats from original .wav (wav side of compression condition)
-    # Each entry is a speaker folder containing mean/, standard_dev/, variance/
+    # Mother folder for pre-computed .wav F0 stats (wav side of compression condition)
+    # Must contain speaker sub-folders, each with mean/, standard_dev/, variance/
     f0_wav_folder_paths=[
-        "feature_extraction/AndroidsResults/F0_results/F0_yin/F0_results_IT/IT_01_CF56_1_segmented",
-        "feature_extraction/AndroidsResults/F0_results/F0_yin/F0_results_IT/IT_02_CM57_2_segmented",
+        "feature_extraction/AndroidsResults/F0_results/F0_yin/F0_results_IT",
     ],
 
-    # Frame-level F0 value CSVs to halve (values/ folders)
+    # Mother folder for frame-level F0 value CSVs (used for halving)
+    # Must contain speaker sub-folders, each with a values/ sub-folder
     f0_values_folder_paths=[
-        "feature_extraction/AndroidsResults/F0_results/F0_yin/F0_results_IT/IT_01_CF56_1_segmented/values",
-        "feature_extraction/AndroidsResults/F0_results/F0_yin/F0_results_IT/IT_02_CM57_2_segmented/values",
+        "feature_extraction/AndroidsResults/F0_results/F0_yin/F0_results_IT",
     ],
 
-    # Pre-computed F0 stats from full dataset (full side of halving condition)
+    # Mother folder for full-dataset F0 stats (full side of halving condition)
+    # Same structure as f0_wav_folder_paths
     f0_full_folder_paths=[
-        "feature_extraction/AndroidsResults/F0_results/F0_yin/F0_results_IT/IT_01_CF56_1_segmented",
-        "feature_extraction/AndroidsResults/F0_results/F0_yin/F0_results_IT/IT_02_CM57_2_segmented",
+        "feature_extraction/AndroidsResults/F0_results/F0_yin/F0_results_IT",
     ],
 
-    # Pre-computed F0 stats for noisy and denoised conditions
+    # Mother folders for noisy and denoised F0 stats
+    # Each must contain speaker sub-folders with mean/, standard_dev/, variance/
     noisy_folder_paths=[
         "feature_extraction/AndroidsResults/F0_results/F0_yin/F0_results_IT_noisy",
     ],
@@ -252,17 +254,11 @@ main(
         "feature_extraction/AndroidsResults/F0_results/F0_yin/F0_results_IT_denoised",
     ],
 
-    # F0 extraction toolboxes: tool name → speaker folders (mean/standard_dev/variance)
+    # Toolboxes: tool name → mother folder(s) containing speaker sub-folders
     toolbox_folder_paths={
-        "egemaps": [
-            "feature_extraction/AndroidsResults/F0_results/F0_egemaps/F0_results_IT/IT_01_CF56_1_segmented",
-        ],
-        "praat": [
-            "feature_extraction/AndroidsResults/F0_results/F0_praat/F0_results_IT/IT_01_CF56_1_segmented",
-        ],
-        "librosa": [
-            "feature_extraction/AndroidsResults/F0_results/F0_librosa/F0_results_IT/IT_01_CF56_1_segmented",
-        ],
+        "egemaps": ["feature_extraction/AndroidsResults/F0_results/F0_egemaps/F0_results_IT"],
+        "praat":   ["feature_extraction/AndroidsResults/F0_results/F0_praat/F0_results_IT"],
+        "librosa": ["feature_extraction/AndroidsResults/F0_results/F0_librosa/F0_results_IT"],
     },
 
     # Optional
@@ -273,25 +269,37 @@ main(
 
 The output file `lmm_verification.csv` is ready to be loaded directly into R for LMM fitting.
 
-#### Expected folder structure for pre-computed F0 stats
+#### Expected folder structure
 
-Each speaker folder passed to the pipeline functions must follow this layout:
-
-```
-IT_01_CF56_1_segmented/
-├── mean/
-│   └── IT_01_CF56_1_segmented_mean.csv          # columns: Utterance_File, F0_Mean
-├── standard_dev/
-│   └── IT_01_CF56_1_segmented_standard_dev.csv  # columns: Utterance_File, F0_StdDev
-└── variance/
-    └── IT_01_CF56_1_segmented_variance.csv       # columns: Utterance_File, F0_Variance
-```
-
-Frame-level value folders (used for halving) must contain per-utterance CSVs:
+The pipeline expects mother folders whose sub-folders are speaker directories. Each speaker directory follows this layout:
 
 ```
-values/
-├── IT_01_CF56_1_utt001.csv   # columns: Start_Time, End_Time, F0_Hz
-├── IT_01_CF56_1_utt002.csv
+F0_results_IT/                                    ← mother folder (what you pass)
+├── IT_01_CF56_1_segmented/                       ← speaker folder (auto-discovered)
+│   ├── mean/
+│   │   └── IT_01_CF56_1_segmented_mean.csv       # Utterance_File, F0_Mean
+│   ├── standard_dev/
+│   │   └── IT_01_CF56_1_segmented_standard_dev.csv  # Utterance_File, F0_StdDev
+│   ├── variance/
+│   │   └── IT_01_CF56_1_segmented_variance.csv   # Utterance_File, F0_Variance
+│   └── values/
+│       ├── IT_01_CF56_1_utt001.csv               # Start_Time, End_Time, F0_Hz
+│       ├── IT_01_CF56_1_utt002.csv
+│       └── ...
+├── IT_02_CM57_2_segmented/
+│   └── ...
+└── ...
+```
+
+For `.wav` source files the same mother-folder convention applies:
+
+```
+segmented_IT/                                     ← mother folder (what you pass)
+├── IT_01_CF56_1_segmented/
+│   ├── IT_01_CF56_1_utt001.wav
+│   ├── IT_01_CF56_1_utt002.wav
+│   └── ...
+├── IT_02_CM57_2_segmented/
+│   └── ...
 └── ...
 ```
