@@ -9,12 +9,13 @@ import pandas as pd
 from pydub import AudioSegment
 
 
-def wav_to_mp3(wav_files: list[str], output_dir: str = "mp3_converted", bitrate: str = "128k") -> list[str]:
+def wav_to_mp3(folder_paths: list[str], output_dir: str = "mp3_converted", bitrate: str = "128k") -> list[str]:
     """
-    Convert a list of .wav files to .mp3 files stored in a dedicated output folder.
+    Convert every .wav file found in a list of folders to .mp3 files stored in a
+    dedicated output folder.
 
     Args:
-        wav_files: Paths to input .wav files.
+        folder_paths: Paths to folders containing .wav files to convert.
         output_dir: Path to the folder where .mp3 files will be saved.
         bitrate: MP3 compression bitrate (e.g. "64k", "128k", "192k", "320k").
 
@@ -26,17 +27,20 @@ def wav_to_mp3(wav_files: list[str], output_dir: str = "mp3_converted", bitrate:
 
     output_paths = []
 
-    for wav_path in wav_files:
-        src = Path(wav_path)
-        if not src.exists():
-            raise FileNotFoundError(f"File not found: {src}")
-        if src.suffix.lower() != ".wav":
-            raise ValueError(f"Expected a .wav file, got: {src}")
+    for folder_path in folder_paths:
+        src_dir = Path(folder_path)
+        if not src_dir.is_dir():
+            raise NotADirectoryError(f"Not a directory: {src_dir}")
 
-        dst = dst_dir / src.with_suffix(".mp3").name
-        audio = AudioSegment.from_wav(str(src))
-        audio.export(str(dst), format="mp3", bitrate=bitrate)
-        output_paths.append(str(dst))
+        wav_files = list(src_dir.glob("*.wav"))
+        if not wav_files:
+            raise FileNotFoundError(f"No .wav files found in: {src_dir}")
+
+        for src in wav_files:
+            dst = dst_dir / src.with_suffix(".mp3").name
+            audio = AudioSegment.from_wav(str(src))
+            audio.export(str(dst), format="mp3", bitrate=bitrate)
+            output_paths.append(str(dst))
 
     return output_paths
 
