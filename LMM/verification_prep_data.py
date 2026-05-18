@@ -15,7 +15,10 @@ def wav_to_mp3(folder_paths: list[str], output_dir: str = "mp3_converted", bitra
     dedicated output folder.
 
     Args:
-        folder_paths: Paths to folders containing .wav files to convert.
+        folder_paths: Mother folders to search recursively for .wav files.
+                      Each folder is walked and every .wav found at any depth
+                      is converted (e.g. provide the segmented speaker parent
+                      folder and all speaker sub-folders are processed).
         output_dir: Path to the folder where .mp3 files will be saved.
         bitrate: MP3 compression bitrate (e.g. "64k", "128k", "192k", "320k").
 
@@ -32,9 +35,9 @@ def wav_to_mp3(folder_paths: list[str], output_dir: str = "mp3_converted", bitra
         if not src_dir.is_dir():
             raise NotADirectoryError(f"Not a directory: {src_dir}")
 
-        wav_files = list(src_dir.glob("*.wav"))
+        wav_files = list(src_dir.rglob("*.wav"))
         if not wav_files:
-            raise FileNotFoundError(f"No .wav files found in: {src_dir}")
+            raise FileNotFoundError(f"No .wav files found under: {src_dir}")
 
         for src in wav_files:
             dst = dst_dir / src.with_suffix(".mp3").name
@@ -161,48 +164,26 @@ def add_f0_stats_compression_to_csv(
 
     Args:
         csv_path:             Main CSV file to enrich (rows appended, saved in place).
-        mp3_folder_paths:     Folders containing the .mp3 files to extract F0 from.
-        f0_csv_folder_paths:  Speaker folders each directly containing mean/,
-                              standard_dev/, and variance/ sub-folders with
-                              pre-computed per-utterance F0 stats from .wav files
-                              (e.g. [".../IT_01_CF56_1_segmented"]).
+        mp3_folder_paths:     Folders to search recursively for .mp3 files.
+        f0_csv_folder_paths:  Mother folders each containing speaker sub-folders
+                              that directly hold mean/, standard_dev/, and variance/
+                              sub-folders with pre-computed per-utterance F0 stats
+                              from .wav files (e.g. [".../F0_results_IT"]).
 
     Returns:
         Path to the updated CSV file.
     """
-    # --- Index .mp3 files by stem across all mp3 folders ---
+    # --- Index .mp3 files by stem across all mp3 folders (recursive) ---
     mp3_index: dict[str, Path] = {}
     for folder_path in mp3_folder_paths:
         mp3_dir = Path(folder_path)
         if not mp3_dir.is_dir():
             raise NotADirectoryError(f"Not a directory: {mp3_dir}")
-        for p in mp3_dir.glob("*.mp3"):
+        for p in mp3_dir.rglob("*.mp3"):
             mp3_index[p.stem] = p
 
-    # --- Build wav F0 index from mean/standard_dev/variance sub-folders ---
-    wav_index: dict[str, tuple] = {}
-    for folder_path in f0_csv_folder_paths:
-        f0_dir = Path(folder_path)
-        if not f0_dir.is_dir():
-            raise NotADirectoryError(f"Not a directory: {f0_dir}")
-
-        mean_csvs = list((f0_dir / "mean").glob("*.csv"))
-        std_csvs  = list((f0_dir / "standard_dev").glob("*.csv"))
-        var_csvs  = list((f0_dir / "variance").glob("*.csv"))
-
-        if not mean_csvs or not std_csvs or not var_csvs:
-            raise FileNotFoundError(
-                f"Missing mean/, standard_dev/, or variance/ CSVs in: {f0_dir}"
-            )
-
-        df_merged = (
-            pd.read_csv(mean_csvs[0])
-            .merge(pd.read_csv(std_csvs[0]), on="Utterance_File")
-            .merge(pd.read_csv(var_csvs[0]), on="Utterance_File")
-        )
-        for _, row in df_merged.iterrows():
-            stem = Path(str(row["Utterance_File"])).stem
-            wav_index[stem] = (row["F0_Mean"], row["F0_StdDev"], row["F0_Variance"])
+    # --- Build wav F0 index by iterating speaker sub-folders ---
+    wav_index = _build_f0_index(f0_csv_folder_paths)
 
     # --- Load main CSV ---
     main_df = pd.read_csv(csv_path)
@@ -291,16 +272,18 @@ def add_halved_f0_to_csv(
 
     Args:
         csv_path:             Main CSV file to enrich (rows appended, saved in place).
-        halved_folder_paths:  Folders containing per-utterance frame-level F0 CSVs
-                              from the halved data (Start_Time, End_Time, F0_Hz).
-        f0_csv_folder_paths:  Speaker folders each directly containing mean/,
-                              standard_dev/, and variance/ sub-folders with
-                              pre-computed per-utterance F0 stats from the full data.
+        halved_folder_paths:  Folders to search recursively for per-utterance
+                              frame-level F0 CSVs from the halved data
+                              (Start_Time, End_Time, F0_Hz).
+        f0_csv_folder_paths:  Mother folders each containing speaker sub-folders
+                              that directly hold mean/, standard_dev/, and variance/
+                              sub-folders with pre-computed F0 stats from the full data
+                              (e.g. [".../F0_results_IT"]).
 
     Returns:
         Path to the updated CSV file.
     """
-    # --- Index halved frame-level CSVs by stem ---
+    # --- Index halved frame-level CSVs by stem (recursive) ---
     halved_index: dict[str, Path] = {}
     for folder_path in halved_folder_paths:
         src_dir = Path(folder_path)
@@ -309,30 +292,8 @@ def add_halved_f0_to_csv(
         for f0_csv in src_dir.rglob("*.csv"):
             halved_index[f0_csv.stem] = f0_csv
 
-    # --- Build full F0 index from mean/standard_dev/variance sub-folders ---
-    full_index: dict[str, tuple] = {}
-    for folder_path in f0_csv_folder_paths:
-        f0_dir = Path(folder_path)
-        if not f0_dir.is_dir():
-            raise NotADirectoryError(f"Not a directory: {f0_dir}")
-
-        mean_csvs = list((f0_dir / "mean").glob("*.csv"))
-        std_csvs  = list((f0_dir / "standard_dev").glob("*.csv"))
-        var_csvs  = list((f0_dir / "variance").glob("*.csv"))
-
-        if not mean_csvs or not std_csvs or not var_csvs:
-            raise FileNotFoundError(
-                f"Missing mean/, standard_dev/, or variance/ CSVs in: {f0_dir}"
-            )
-
-        df_merged = (
-            pd.read_csv(mean_csvs[0])
-            .merge(pd.read_csv(std_csvs[0]), on="Utterance_File")
-            .merge(pd.read_csv(var_csvs[0]), on="Utterance_File")
-        )
-        for _, row in df_merged.iterrows():
-            stem = Path(str(row["Utterance_File"])).stem
-            full_index[stem] = (row["F0_Mean"], row["F0_StdDev"], row["F0_Variance"])
+    # --- Build full F0 index by iterating speaker sub-folders ---
+    full_index = _build_f0_index(f0_csv_folder_paths)
 
     # --- Load main CSV ---
     main_df = pd.read_csv(csv_path)
@@ -682,14 +643,24 @@ def main(
     # 1 — Convert wav to mp3
     wav_to_mp3(wav_folder_paths, mp3_output_dir, mp3_bitrate)
 
-    # 2 — Halve frame-level F0 value CSVs; returns the halved folder paths
-    halved_folder_paths = halve_csv_files(f0_values_folder_paths, halve_seed)
+    # 2 — Discover values/ sub-folders inside each speaker dir of the mother folders,
+    #     then halve the frame-level CSVs found there.
+    values_paths: list[str] = []
+    for mother_path in f0_values_folder_paths:
+        mother_dir = Path(mother_path)
+        for speaker_dir in sorted(mother_dir.iterdir()):
+            if speaker_dir.is_dir():
+                values_dir = speaker_dir / "values"
+                if values_dir.is_dir():
+                    values_paths.append(str(values_dir))
+    halved_folder_paths = halve_csv_files(values_paths, halve_seed)
 
-    # 3 — Build template CSV (one row per utterance, conditions all NaN)
+    # 3 — Build template CSV (one row per utterance, conditions all NaN).
+    #     Recurse into all sub-folders of each wav mother folder.
     template_rows = []
     for folder_path in wav_folder_paths:
         src_dir = Path(folder_path)
-        for wav_file in sorted(src_dir.glob("*.wav")):
+        for wav_file in sorted(src_dir.rglob("*.wav")):
             stem = wav_file.stem
             template_rows.append({
                 "Utterance_File":      stem,
