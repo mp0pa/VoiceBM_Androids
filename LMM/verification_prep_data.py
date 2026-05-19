@@ -1,5 +1,6 @@
 import random
 import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -7,6 +8,8 @@ import numpy as np
 import librosa
 import pandas as pd
 from pydub import AudioSegment
+
+_F0_DTYPE = {"F0_Mean": "float64", "F0_StdDev": "float64", "F0_Variance": "float64"}
 
 
 def wav_to_mp3(folder_paths: list[str], output_dir: str = "mp3_converted", bitrate: str = "128k") -> list[str]:
@@ -29,7 +32,6 @@ def wav_to_mp3(folder_paths: list[str], output_dir: str = "mp3_converted", bitra
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     output_paths = []
-
     for folder_path in folder_paths:
         src_dir = Path(folder_path)
         if not src_dir.is_dir():
@@ -41,8 +43,7 @@ def wav_to_mp3(folder_paths: list[str], output_dir: str = "mp3_converted", bitra
 
         for src in wav_files:
             dst = dst_dir / src.with_suffix(".mp3").name
-            audio = AudioSegment.from_wav(str(src))
-            audio.export(str(dst), format="mp3", bitrate=bitrate)
+            AudioSegment.from_wav(str(src)).export(str(dst), format="mp3", bitrate=bitrate)
             output_paths.append(str(dst))
 
     return output_paths
@@ -82,8 +83,7 @@ def halve_csv_files(folder_paths: list[str], seed: Optional[int] = None) -> list
                 header = next(reader, None)
                 rows = list(reader)
 
-            keep_count = max(1, len(rows) // 2)
-            kept_rows = rng.sample(rows, keep_count)
+            kept_rows = rng.sample(rows, max(1, len(rows) // 2))
 
             dst_file = dst_dir / csv_file.name
             with open(dst_file, "w", newline="", encoding="utf-8") as f:
@@ -99,11 +99,17 @@ def halve_csv_files(folder_paths: list[str], seed: Optional[int] = None) -> list
 
 # Base (reference) level for each condition column.
 _BASE_CONDITIONS: dict[str, str] = {
-    "toolbox":      "egemaps",
+    "toolbox":      "librosa",
     "noise":        "noisy",
     "compression":  "wav",
     "dataset_size": "full",
 }
+
+# Suffixes that identify already-expanded condition rows; used to prevent
+# each add_* step from compounding conditions across steps.
+_COND_SUFFIXES: tuple[str, ...] = (
+    "_compression_", "_halving_", "_noise_", "_toolbox_"
+)
 
 
 def _conditions_from_utterance_id(utterance_id: str) -> dict[str, str]:
@@ -143,6 +149,86 @@ def _conditions_from_utterance_id(utterance_id: str) -> dict[str, str]:
     return conditions
 
 
+def _build_f0_index(folder_paths: list[str]) -> dict[str, tuple]:
+    """
+    Walk a list of F0 extraction output folders and build a speaker_id → (mean, std, var)
+    lookup, aggregating all utterances that belong to the same speaker.
+
+    Expected structure (output of extract_f0 scripts):
+        <folder>/
+          <speaker_dir>/
+            mean/        <speaker>_mean.csv        → Utterance_File, F0_Mean
+            standard_dev/<speaker>_standard_dev.csv → Utterance_File, F0_StdDev
+            variance/    <speaker>_variance.csv     → Utterance_File, F0_Variance
+
+    The speaker ID (e.g. "IT_01_CF56_1" stripped of "_utt###") is used as key.
+    Aggregation: F0_Mean = mean of utterance means;
+                 F0_Variance = mean of utterance variances + variance of utterance means
+                 (law of total variance); F0_StdDev = sqrt(F0_Variance).
+    """
+    speaker_data: dict[str, list[tuple[float, float, float]]] = {}
+
+    for folder_path in folder_paths:
+        src_dir = Path(folder_path)
+        if not src_dir.is_dir():
+            raise NotADirectoryError(f"Not a directory: {src_dir}")
+
+        for speaker_dir in sorted(src_dir.iterdir()):
+            if not speaker_dir.is_dir():
+                continue
+
+            mean_dir = speaker_dir / "mean"
+            std_dir  = speaker_dir / "standard_dev"
+            var_dir  = speaker_dir / "variance"
+
+            if not all(d.is_dir() for d in (mean_dir, std_dir, var_dir)):
+                continue
+
+            mean_csvs = list(mean_dir.glob("*.csv"))
+            std_csvs  = list(std_dir.glob("*.csv"))
+            var_csvs  = list(var_dir.glob("*.csv"))
+
+            if not mean_csvs or not std_csvs or not var_csvs:
+                continue
+
+            df = (
+                pd.read_csv(mean_csvs[0])
+                  .merge(pd.read_csv(std_csvs[0]), on="Utterance_File")
+                  .merge(pd.read_csv(var_csvs[0]), on="Utterance_File")
+            )
+
+            for utt, mean, std, var in zip(
+                df["Utterance_File"], df["F0_Mean"], df["F0_StdDev"], df["F0_Variance"]
+            ):
+                spk = _speaker_id_from_stem(Path(str(utt)).stem)
+                speaker_data.setdefault(spk, []).append((float(mean), float(std), float(var)))
+
+    index: dict[str, tuple] = {}
+    for spk, stats in speaker_data.items():
+        means = np.array([s[0] for s in stats])
+        vars_ = np.array([s[2] for s in stats])
+        agg_mean = float(np.mean(means))
+        agg_var  = float(np.mean(vars_) + np.var(means))
+        agg_std  = float(np.sqrt(agg_var))
+        index[spk] = (agg_mean, agg_std, agg_var)
+
+    return index
+
+
+def _extract_mp3_f0(mp3_path: Path) -> tuple[float, float, float]:
+    y, sr = librosa.load(str(mp3_path), sr=None)
+    f0, _, _ = librosa.pyin(
+        y, fmin=50, fmax=500, sr=sr,
+        hop_length=int(sr * 0.010), center=False,
+    )
+    voiced = f0[~np.isnan(f0)]
+    return (
+        float(voiced.mean()) if len(voiced) > 0 else 0.0,
+        float(voiced.std())  if len(voiced) > 1 else 0.0,
+        float(voiced.var())  if len(voiced) > 1 else 0.0,
+    )
+
+
 def add_f0_stats_compression_to_csv(
     csv_path: str,
     mp3_folder_paths: list[str],
@@ -173,76 +259,73 @@ def add_f0_stats_compression_to_csv(
     Returns:
         Path to the updated CSV file.
     """
-    # --- Index .mp3 files by stem across all mp3 folders (recursive) ---
-    mp3_index: dict[str, Path] = {}
+    # Index .mp3 files by speaker across all mp3 folders (recursive)
+    mp3_speaker_index: dict[str, list[Path]] = {}
     for folder_path in mp3_folder_paths:
         mp3_dir = Path(folder_path)
         if not mp3_dir.is_dir():
             raise NotADirectoryError(f"Not a directory: {mp3_dir}")
         for p in mp3_dir.rglob("*.mp3"):
-            mp3_index[p.stem] = p
+            spk = _speaker_id_from_stem(p.stem)
+            mp3_speaker_index.setdefault(spk, []).append(p)
 
-    # --- Build wav F0 index by iterating speaker sub-folders ---
     wav_index = _build_f0_index(f0_csv_folder_paths)
 
-    # --- Load main CSV ---
-    main_df = pd.read_csv(csv_path)
+    # Extract F0 stats for all mp3 utterances in parallel, then aggregate per speaker
+    mp3_utt_cache: dict[str, tuple] = {}
+    all_mp3_paths = [p for paths in mp3_speaker_index.values() for p in paths]
+    with ThreadPoolExecutor() as executor:
+        future_to_path = {executor.submit(_extract_mp3_f0, p): p for p in all_mp3_paths}
+        for future in as_completed(future_to_path):
+            path = future_to_path[future]
+            try:
+                mp3_utt_cache[path.stem] = future.result()
+            except Exception as e:
+                print(f"  [Error] Processing {path.name}: {e}")
+                mp3_utt_cache[path.stem] = (np.nan, np.nan, np.nan)
 
+    mp3_f0_cache: dict[str, tuple] = {}
+    for spk, paths in mp3_speaker_index.items():
+        utt_stats = [mp3_utt_cache[p.stem] for p in paths if p.stem in mp3_utt_cache]
+        valid = [(m, s, v) for m, s, v in utt_stats if not np.isnan(m)]
+        if not valid:
+            mp3_f0_cache[spk] = (np.nan, np.nan, np.nan)
+        else:
+            means = np.array([s[0] for s in valid])
+            vars_ = np.array([s[2] for s in valid])
+            agg_mean = float(np.mean(means))
+            agg_var  = float(np.mean(vars_) + np.var(means))
+            mp3_f0_cache[spk] = (agg_mean, float(np.sqrt(agg_var)), agg_var)
+
+    main_df = pd.read_csv(csv_path, dtype=_F0_DTYPE)
     new_rows = []
 
-    for _, source_row in main_df.iterrows():
-        stem = Path(str(source_row["Utterance_File"])).stem
+    base_mask = ~main_df["Utterance_File"].astype(str).apply(
+        lambda x: any(s in x for s in _COND_SUFFIXES)
+    )
+    for source_record in main_df[base_mask].to_dict("records"):
+        stem = Path(str(source_record["Utterance_File"])).stem
+        base_cond = _conditions_from_utterance_id(str(source_record["Utterance_File"]))
 
-        # --- Row for mp3 condition ---
-        mp3_row = source_row.copy()
-        mp3_row["Utterance_File"] = f"{stem}_compression_mp3"
-        _cond = _conditions_from_utterance_id(str(source_row["Utterance_File"]))
-        _cond["compression"] = "mp3"
-        for _col, _val in _cond.items():
-            mp3_row[_col] = _val
-
-        mp3_path = mp3_index.get(stem)
-        if mp3_path is None:
-            print(f"  [Warning] No .mp3 found for '{stem}', filling F0 with NaN.")
-            mp3_row["F0_Mean"] = np.nan
-            mp3_row["F0_StdDev"] = np.nan
-            mp3_row["F0_Variance"] = np.nan
+        # mp3 row
+        mp3_record = {**source_record, "Utterance_File": f"{stem}_compression_mp3",
+                      **base_cond, "compression": "mp3"}
+        if stem in mp3_f0_cache:
+            mp3_record["F0_Mean"], mp3_record["F0_StdDev"], mp3_record["F0_Variance"] = mp3_f0_cache[stem]
         else:
-            try:
-                y, sr = librosa.load(str(mp3_path), sr=None)
-                hop_length = int(sr * 0.010)
-                f0, _, _ = librosa.pyin(
-                    y, fmin=50, fmax=500, sr=sr, hop_length=hop_length, center=False
-                )
-                voiced_f0 = f0[~np.isnan(f0)]
-                mp3_row["F0_Mean"]     = voiced_f0.mean() if len(voiced_f0) > 0 else 0.0
-                mp3_row["F0_StdDev"]   = voiced_f0.std()  if len(voiced_f0) > 1 else 0.0
-                mp3_row["F0_Variance"] = voiced_f0.var()  if len(voiced_f0) > 1 else 0.0
-            except Exception as e:
-                print(f"  [Error] Processing {mp3_path.name}: {e}")
-                mp3_row["F0_Mean"] = np.nan
-                mp3_row["F0_StdDev"] = np.nan
-                mp3_row["F0_Variance"] = np.nan
+            print(f"  [Warning] No .mp3 found for speaker '{stem}', filling F0 with NaN.")
+            mp3_record["F0_Mean"] = mp3_record["F0_StdDev"] = mp3_record["F0_Variance"] = np.nan
+        new_rows.append(mp3_record)
 
-        new_rows.append(mp3_row)
-
-        # --- Row for wav condition ---
-        wav_row = source_row.copy()
-        wav_row["Utterance_File"] = f"{stem}_compression_wav"
-        _cond = _conditions_from_utterance_id(str(source_row["Utterance_File"]))
-        _cond["compression"] = "wav"
-        for _col, _val in _cond.items():
-            wav_row[_col] = _val
-
+        # wav row
+        wav_record = {**source_record, "Utterance_File": f"{stem}_compression_wav",
+                      **base_cond, "compression": "wav"}
         if stem in wav_index:
-            wav_row["F0_Mean"], wav_row["F0_StdDev"], wav_row["F0_Variance"] = wav_index[stem]
+            wav_record["F0_Mean"], wav_record["F0_StdDev"], wav_record["F0_Variance"] = wav_index[stem]
         else:
-            print(f"  [Warning] No wav F0 stats found for '{stem}', filling with NaN.")
-            wav_row["F0_Mean"] = np.nan
-            wav_row["F0_StdDev"] = np.nan
-            wav_row["F0_Variance"] = np.nan
-
-        new_rows.append(wav_row)
+            print(f"  [Warning] No wav F0 stats found for speaker '{stem}', filling with NaN.")
+            wav_record["F0_Mean"] = wav_record["F0_StdDev"] = wav_record["F0_Variance"] = np.nan
+        new_rows.append(wav_record)
 
     result_df = pd.concat([main_df, pd.DataFrame(new_rows)], ignore_index=True)
     result_df.to_csv(csv_path, index=False)
@@ -283,132 +366,65 @@ def add_halved_f0_to_csv(
     Returns:
         Path to the updated CSV file.
     """
-    # --- Index halved frame-level CSVs by stem (recursive) ---
-    halved_index: dict[str, Path] = {}
+    # Index halved frame-level CSVs by speaker (recursive), grouping all utterances
+    halved_speaker_index: dict[str, list[Path]] = {}
     for folder_path in halved_folder_paths:
         src_dir = Path(folder_path)
         if not src_dir.is_dir():
             raise NotADirectoryError(f"Not a directory: {src_dir}")
         for f0_csv in src_dir.rglob("*.csv"):
-            halved_index[f0_csv.stem] = f0_csv
+            spk = _speaker_id_from_stem(f0_csv.stem)
+            halved_speaker_index.setdefault(spk, []).append(f0_csv)
 
-    # --- Build full F0 index by iterating speaker sub-folders ---
     full_index = _build_f0_index(f0_csv_folder_paths)
-
-    # --- Load main CSV ---
-    main_df = pd.read_csv(csv_path)
-
+    main_df = pd.read_csv(csv_path, dtype=_F0_DTYPE)
     new_rows = []
 
-    for _, source_row in main_df.iterrows():
-        stem = Path(str(source_row["Utterance_File"])).stem
+    base_mask = ~main_df["Utterance_File"].astype(str).apply(
+        lambda x: any(s in x for s in _COND_SUFFIXES)
+    )
+    for source_record in main_df[base_mask].to_dict("records"):
+        stem = Path(str(source_record["Utterance_File"])).stem
+        base_cond = _conditions_from_utterance_id(str(source_record["Utterance_File"]))
 
-        # --- Row for halved condition ---
-        halved_row = source_row.copy()
-        halved_row["Utterance_File"] = f"{stem}_halving_halved"
-        _cond = _conditions_from_utterance_id(str(source_row["Utterance_File"]))
-        _cond["dataset_size"] = "halved"
-        for _col, _val in _cond.items():
-            halved_row[_col] = _val
-
-        f0_csv_path = halved_index.get(stem)
-        if f0_csv_path is None:
-            print(f"  [Warning] No halved F0 CSV found for '{stem}', filling with NaN.")
-            halved_row["F0_Mean"] = np.nan
-            halved_row["F0_StdDev"] = np.nan
-            halved_row["F0_Variance"] = np.nan
+        # halved row — pool all voiced frames across utterances for this speaker
+        halved_record = {**source_record, "Utterance_File": f"{stem}_halving_halved",
+                         **base_cond, "dataset_size": "halved"}
+        csv_paths = halved_speaker_index.get(stem)
+        if csv_paths is None:
+            print(f"  [Warning] No halved F0 CSV found for speaker '{stem}', filling with NaN.")
+            halved_record["F0_Mean"] = halved_record["F0_StdDev"] = halved_record["F0_Variance"] = np.nan
         else:
             try:
-                df_f0 = pd.read_csv(f0_csv_path)
-                f0_col_candidates = [c for c in df_f0.columns if c.startswith("F0_")]
-                if not f0_col_candidates:
-                    raise ValueError(f"No F0 column found in {f0_csv_path.name}.")
-                f0_col = f0_col_candidates[0]
-                voiced = df_f0[df_f0[f0_col] > 0][f0_col]
-                halved_row["F0_Mean"]     = voiced.mean() if len(voiced) > 0 else 0.0
-                halved_row["F0_StdDev"]   = voiced.std()  if len(voiced) > 1 else 0.0
-                halved_row["F0_Variance"] = voiced.var()  if len(voiced) > 1 else 0.0
+                voiced_frames = []
+                for f0_csv_path in csv_paths:
+                    df_f0 = pd.read_csv(f0_csv_path)
+                    f0_col_candidates = [c for c in df_f0.columns if c.startswith("F0_")]
+                    if not f0_col_candidates:
+                        raise ValueError(f"No F0 column found in {f0_csv_path.name}.")
+                    voiced_frames.append(df_f0[df_f0[f0_col_candidates[0]] > 0][f0_col_candidates[0]])
+                voiced = pd.concat(voiced_frames) if voiced_frames else pd.Series([], dtype=float)
+                halved_record["F0_Mean"]     = float(voiced.mean()) if len(voiced) > 0 else 0.0
+                halved_record["F0_StdDev"]   = float(voiced.std())  if len(voiced) > 1 else 0.0
+                halved_record["F0_Variance"] = float(voiced.var())  if len(voiced) > 1 else 0.0
             except Exception as e:
-                print(f"  [Error] Processing {f0_csv_path.name}: {e}")
-                halved_row["F0_Mean"] = np.nan
-                halved_row["F0_StdDev"] = np.nan
-                halved_row["F0_Variance"] = np.nan
+                print(f"  [Error] Processing halved CSVs for '{stem}': {e}")
+                halved_record["F0_Mean"] = halved_record["F0_StdDev"] = halved_record["F0_Variance"] = np.nan
+        new_rows.append(halved_record)
 
-        new_rows.append(halved_row)
-
-        # --- Row for full condition ---
-        full_row = source_row.copy()
-        full_row["Utterance_File"] = f"{stem}_halving_full"
-        _cond = _conditions_from_utterance_id(str(source_row["Utterance_File"]))
-        _cond["dataset_size"] = "full"
-        for _col, _val in _cond.items():
-            full_row[_col] = _val
-
+        # full row
+        full_record = {**source_record, "Utterance_File": f"{stem}_halving_full",
+                       **base_cond, "dataset_size": "full"}
         if stem in full_index:
-            full_row["F0_Mean"], full_row["F0_StdDev"], full_row["F0_Variance"] = full_index[stem]
+            full_record["F0_Mean"], full_record["F0_StdDev"], full_record["F0_Variance"] = full_index[stem]
         else:
             print(f"  [Warning] No full F0 stats found for '{stem}', filling with NaN.")
-            full_row["F0_Mean"] = np.nan
-            full_row["F0_StdDev"] = np.nan
-            full_row["F0_Variance"] = np.nan
-
-        new_rows.append(full_row)
+            full_record["F0_Mean"] = full_record["F0_StdDev"] = full_record["F0_Variance"] = np.nan
+        new_rows.append(full_record)
 
     result_df = pd.concat([main_df, pd.DataFrame(new_rows)], ignore_index=True)
     result_df.to_csv(csv_path, index=False)
     return csv_path
-
-
-def _build_f0_index(folder_paths: list[str]) -> dict[str, tuple]:
-    """
-    Walk a list of F0 extraction output folders and build a stem → (mean, std, var)
-    lookup.
-
-    Expected structure (output of extract_f0 scripts):
-        <folder>/
-          <speaker_dir>/          ← "master folder", identifies the speaker
-            mean/        <speaker>_mean.csv        → Utterance_File, F0_Mean
-            standard_dev/<speaker>_standard_dev.csv → Utterance_File, F0_StdDev
-            variance/    <speaker>_variance.csv     → Utterance_File, F0_Variance
-
-    The utterance stem (e.g. "spk01_utt003" from "spk01_utt003.wav") is used as key.
-    """
-    index: dict[str, tuple] = {}
-
-    for folder_path in folder_paths:
-        src_dir = Path(folder_path)
-        if not src_dir.is_dir():
-            raise NotADirectoryError(f"Not a directory: {src_dir}")
-
-        for speaker_dir in sorted(src_dir.iterdir()):
-            if not speaker_dir.is_dir():
-                continue
-
-            mean_dir = speaker_dir / "mean"
-            std_dir  = speaker_dir / "standard_dev"
-            var_dir  = speaker_dir / "variance"
-
-            if not all(d.is_dir() for d in [mean_dir, std_dir, var_dir]):
-                continue
-
-            mean_csvs = list(mean_dir.glob("*.csv"))
-            std_csvs  = list(std_dir.glob("*.csv"))
-            var_csvs  = list(var_dir.glob("*.csv"))
-
-            if not mean_csvs or not std_csvs or not var_csvs:
-                continue
-
-            df_mean = pd.read_csv(mean_csvs[0])
-            df_std  = pd.read_csv(std_csvs[0])
-            df_var  = pd.read_csv(var_csvs[0])
-
-            df = df_mean.merge(df_std, on="Utterance_File").merge(df_var, on="Utterance_File")
-
-            for _, row in df.iterrows():
-                stem = Path(str(row["Utterance_File"])).stem
-                index[stem] = (row["F0_Mean"], row["F0_StdDev"], row["F0_Variance"])
-
-    return index
 
 
 def add_noisy_denoised_f0_to_csv(
@@ -440,51 +456,29 @@ def add_noisy_denoised_f0_to_csv(
     Returns:
         Path to the updated CSV file.
     """
-    noisy_index    = _build_f0_index(noisy_folder_paths)
-    denoised_index = _build_f0_index(denoised_folder_paths)
-
-    main_df = pd.read_csv(csv_path)
-
+    noise_indices = {
+        "noisy":    _build_f0_index(noisy_folder_paths),
+        "denoised": _build_f0_index(denoised_folder_paths),
+    }
+    main_df = pd.read_csv(csv_path, dtype=_F0_DTYPE)
     new_rows = []
 
-    for _, source_row in main_df.iterrows():
-        stem = Path(str(source_row["Utterance_File"])).stem
+    base_mask = ~main_df["Utterance_File"].astype(str).apply(
+        lambda x: any(s in x for s in _COND_SUFFIXES)
+    )
+    for source_record in main_df[base_mask].to_dict("records"):
+        stem = Path(str(source_record["Utterance_File"])).stem
+        base_cond = _conditions_from_utterance_id(str(source_record["Utterance_File"]))
 
-        # --- Row for noisy condition ---
-        noisy_row = source_row.copy()
-        noisy_row["Utterance_File"] = f"{stem}_noise_noisy"
-        _cond = _conditions_from_utterance_id(str(source_row["Utterance_File"]))
-        _cond["noise"] = "noisy"
-        for _col, _val in _cond.items():
-            noisy_row[_col] = _val
-
-        if stem in noisy_index:
-            noisy_row["F0_Mean"], noisy_row["F0_StdDev"], noisy_row["F0_Variance"] = noisy_index[stem]
-        else:
-            print(f"  [Warning] No noisy F0 found for '{stem}', filling with NaN.")
-            noisy_row["F0_Mean"] = np.nan
-            noisy_row["F0_StdDev"] = np.nan
-            noisy_row["F0_Variance"] = np.nan
-
-        new_rows.append(noisy_row)
-
-        # --- Row for denoised condition ---
-        denoised_row = source_row.copy()
-        denoised_row["Utterance_File"] = f"{stem}_noise_denoised"
-        _cond = _conditions_from_utterance_id(str(source_row["Utterance_File"]))
-        _cond["noise"] = "denoised"
-        for _col, _val in _cond.items():
-            denoised_row[_col] = _val
-
-        if stem in denoised_index:
-            denoised_row["F0_Mean"], denoised_row["F0_StdDev"], denoised_row["F0_Variance"] = denoised_index[stem]
-        else:
-            print(f"  [Warning] No denoised F0 found for '{stem}', filling with NaN.")
-            denoised_row["F0_Mean"] = np.nan
-            denoised_row["F0_StdDev"] = np.nan
-            denoised_row["F0_Variance"] = np.nan
-
-        new_rows.append(denoised_row)
+        for label, index in noise_indices.items():
+            record = {**source_record, "Utterance_File": f"{stem}_noise_{label}",
+                      **base_cond, "noise": label}
+            if stem in index:
+                record["F0_Mean"], record["F0_StdDev"], record["F0_Variance"] = index[stem]
+            else:
+                print(f"  [Warning] No {label} F0 found for '{stem}', filling with NaN.")
+                record["F0_Mean"] = record["F0_StdDev"] = record["F0_Variance"] = np.nan
+            new_rows.append(record)
 
     result_df = pd.concat([main_df, pd.DataFrame(new_rows)], ignore_index=True)
     result_df.to_csv(csv_path, index=False)
@@ -528,40 +522,39 @@ def add_toolbox_f0_to_csv(
     Returns:
         Path to the updated CSV file.
     """
-    # --- Build one F0 index per toolbox ---
     toolbox_indices: dict[str, dict[str, tuple]] = {
         tool: _build_f0_index(folder_paths)
         for tool, folder_paths in toolbox_folder_paths.items()
     }
-
-    main_df = pd.read_csv(csv_path)
-
+    main_df = pd.read_csv(csv_path, dtype=_F0_DTYPE)
     new_rows = []
 
-    for _, source_row in main_df.iterrows():
-        stem = Path(str(source_row["Utterance_File"])).stem
+    base_mask = ~main_df["Utterance_File"].astype(str).apply(
+        lambda x: any(s in x for s in _COND_SUFFIXES)
+    )
+    for source_record in main_df[base_mask].to_dict("records"):
+        stem = Path(str(source_record["Utterance_File"])).stem
+        base_cond = _conditions_from_utterance_id(str(source_record["Utterance_File"]))
 
         for tool, index in toolbox_indices.items():
-            row = source_row.copy()
-            row["Utterance_File"] = f"{stem}_toolbox_{tool}"
-            _cond = _conditions_from_utterance_id(str(source_row["Utterance_File"]))
-            _cond["toolbox"] = tool
-            for _col, _val in _cond.items():
-                row[_col] = _val
-
+            record = {**source_record, "Utterance_File": f"{stem}_toolbox_{tool}", **base_cond, "toolbox": tool}
             if stem in index:
-                row["F0_Mean"], row["F0_StdDev"], row["F0_Variance"] = index[stem]
+                record["F0_Mean"], record["F0_StdDev"], record["F0_Variance"] = index[stem]
             else:
-                print(f"  [Warning] No {tool} F0 found for '{stem}', filling with NaN.")
-                row["F0_Mean"] = np.nan
-                row["F0_StdDev"] = np.nan
-                row["F0_Variance"] = np.nan
-
-            new_rows.append(row)
+                print(f"  [Warning] No {tool} F0 found for speaker '{stem}', filling with NaN.")
+                record["F0_Mean"] = record["F0_StdDev"] = record["F0_Variance"] = np.nan
+            new_rows.append(record)
 
     result_df = pd.concat([main_df, pd.DataFrame(new_rows)], ignore_index=True)
     result_df.to_csv(csv_path, index=False)
     return csv_path
+
+
+def _speaker_id_from_stem(stem: str) -> str:
+    """Strip the _utt### suffix (and optional trailing 'ok') to get the speaker identifier."""
+    idx = stem.find("_utt")
+    spk = stem[:idx] if idx != -1 else stem
+    return spk.removesuffix("ok")
 
 
 def _parse_depression_diagnosis(utterance_stem: str) -> str:
@@ -643,37 +636,37 @@ def main(
     # 1 — Convert wav to mp3
     wav_to_mp3(wav_folder_paths, mp3_output_dir, mp3_bitrate)
 
-    # 2 — Discover values/ sub-folders inside each speaker dir of the mother folders,
-    #     then halve the frame-level CSVs found there.
-    values_paths: list[str] = []
-    for mother_path in f0_values_folder_paths:
-        mother_dir = Path(mother_path)
-        for speaker_dir in sorted(mother_dir.iterdir()):
-            if speaker_dir.is_dir():
-                values_dir = speaker_dir / "values"
-                if values_dir.is_dir():
-                    values_paths.append(str(values_dir))
+    # 2 — Discover values/ sub-folders inside each speaker dir, then halve their CSVs
+    values_paths = [
+        str(speaker_dir / "values")
+        for mother_path in f0_values_folder_paths
+        for speaker_dir in sorted(Path(mother_path).iterdir())
+        if speaker_dir.is_dir() and (speaker_dir / "values").is_dir()
+    ]
     halved_folder_paths = halve_csv_files(values_paths, halve_seed)
 
-    # 3 — Build template CSV (one row per utterance, conditions all NaN).
-    #     Recurse into all sub-folders of each wav mother folder.
-    template_rows = []
+    # 3 — Build template CSV (one row per speaker, conditions all NaN)
+    speaker_ids: dict[str, str] = {}
     for folder_path in wav_folder_paths:
-        src_dir = Path(folder_path)
-        for wav_file in sorted(src_dir.rglob("*.wav")):
-            stem = wav_file.stem
-            template_rows.append({
-                "Utterance_File":      stem,
-                "depression_diagnosis": _parse_depression_diagnosis(stem),
-                "F0_Mean":     np.nan,
-                "F0_StdDev":   np.nan,
-                "F0_Variance": np.nan,
-                "toolbox":     np.nan,
-                "noise":       np.nan,
-                "compression": np.nan,
-                "dataset_size": np.nan,
-            })
+        for wav_file in sorted(Path(folder_path).rglob("*.wav")):
+            spk = _speaker_id_from_stem(wav_file.stem)
+            if spk not in speaker_ids:
+                speaker_ids[spk] = _parse_depression_diagnosis(spk)
 
+    template_rows = [
+        {
+            "Utterance_File":       spk_id,
+            "depression_diagnosis": diag,
+            "F0_Mean":     np.nan,
+            "F0_StdDev":   np.nan,
+            "F0_Variance": np.nan,
+            "toolbox":     np.nan,
+            "noise":       np.nan,
+            "compression": np.nan,
+            "dataset_size": np.nan,
+        }
+        for spk_id, diag in sorted(speaker_ids.items())
+    ]
     pd.DataFrame(template_rows).to_csv(output_csv, index=False)
 
     # 4 — Compression condition rows (mp3 vs wav)
@@ -690,7 +683,6 @@ def main(
 
     # 8 — Drop template rows and reshape to the README nine-column schema
     _CONDITION_COLS = ["toolbox", "noise", "compression", "dataset_size"]
-
     df = pd.read_csv(output_csv)
     df = df.dropna(subset=_CONDITION_COLS, how="all")
     df = df.rename(columns={

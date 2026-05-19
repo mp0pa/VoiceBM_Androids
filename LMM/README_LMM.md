@@ -303,3 +303,200 @@ segmented_IT/                                     ← mother folder (what you pa
 │   └── ...
 └── ...
 ```
+
+---
+
+## analytical_validation_prep_data.py
+
+### Purpose
+
+Prepare a clean `.csv` file to be used in R for fitting **Linear Mixed Models (LMM)** that perform analytical validation of F0 as a biomarker of depression.
+
+Analytical validation proves that no speaker-specific characteristic — sex, age, task type, or speech turn duration — can systematically influence the relationship between F0 and the depression diagnosis. One row is produced **per speaker** (not per utterance), aggregating all utterances belonging to that speaker into a single set of F0 statistics.
+
+---
+
+### Target output
+
+The final `.csv` contains 10 columns:
+
+| Column | Description |
+|---|---|
+| `utterance_id` | Speaker identifier (e.g. `IT_01_CF56_1`) |
+| `F0_mean` | Aggregated mean F0 across all utterances of the speaker (Hz) |
+| `F0_sd` | Aggregated F0 standard deviation (Hz) |
+| `F0_var` | Aggregated F0 variance (Hz²) |
+| `depression_diagnosis` | Depression label: `C` (control) or `P` (patient) |
+| `sex` | Speaker sex: `F` or `M` (from metadata CSV) |
+| `age` | Speaker age (numeric, parsed from the filename) |
+| `age_group` | Age bin: `<47` or `>=47` |
+| `task` | Recording task: `IT` (Interview Task) or `RT` (Reading Task) |
+| `speech_turn_duration` | Mean speech turn duration in seconds (IT speakers only; `NaN` for RT) |
+
+#### Speaker ID convention
+
+Speaker IDs follow the same structure as utterance filenames, without the utterance index:
+
+```
+TASK_PATIENTID_DIAGSEXAGE_EDUCATION
+e.g.  IT_01_CF56_1
+      ^^  ^^  ^^ ^^  ^
+      |   |   |  |   education level
+      |   |   |  age (56)
+      |   |   diagnosis + sex: C/P + F/M  (CF = Control Female)
+      |   patient id
+      task id (IT or RT)
+```
+
+#### F0 aggregation
+
+Per-utterance F0 statistics are aggregated into per-speaker statistics using the **law of total variance**:
+
+- `F0_mean` = mean of per-utterance means
+- `F0_var` = mean of per-utterance variances + variance of per-utterance means
+- `F0_sd` = √(`F0_var`)
+
+#### Age group threshold
+
+Speakers are binned at age **47**:
+
+| Value | Meaning |
+|---|---|
+| `<47` | Speaker younger than 47 |
+| `>=47` | Speaker aged 47 or older |
+
+---
+
+### Functions
+
+#### Internal helpers
+
+##### `_build_f0_index(folder_paths)`
+
+Walks a list of F0 extraction output mother folders and builds a `speaker_id → (mean, sd, var)` lookup, aggregating all utterances per speaker using the law of total variance.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `folder_paths` | `list[str]` | Mother folders each containing speaker sub-folders with `mean/`, `standard_dev/`, and `variance/` sub-folders |
+
+Returns: `dict[str, tuple[float, float, float]]` — speaker_id → (agg_mean, agg_sd, agg_var).
+
+---
+
+##### `_build_metadata_index(metadata_csv_path)`
+
+Parses the metadata CSV and returns a `speaker_id → sex` mapping for both IT and RT speakers.
+
+The metadata CSV contains two side-by-side tables: RT speakers in columns 0–6 (speaker ID at col 0, sex at col 3) and IT speakers in columns 7–13 (speaker ID at col 7, sex at col 10). Speaker IDs in the file may carry single quotes and a trailing `ok` suffix — both are stripped automatically.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `metadata_csv_path` | `str` | Path to the metadata `.csv` file |
+
+Returns: `dict[str, str]` — speaker_id → `"F"` or `"M"`.
+
+---
+
+##### `_build_duration_index(audio_clipok_path)`
+
+Walks the Interview Task audio clip folder and builds an IT `speaker_id → mean speech turn duration (seconds)` mapping.
+
+Speech turn duration is **only available for IT speakers**. Each sub-folder of `audio_clipok` corresponds to one patient; each `.wav` file inside is one speech turn. Duration is read from the audio file header without decoding (via `soundfile`). The per-speaker value is the mean duration across all their speech turn files.
+
+Speaker IDs are derived by stripping the trailing `ok` from the sub-folder name and prepending `IT_` (e.g. `01_CF56_1ok` → `IT_01_CF56_1`).
+
+| Parameter | Type | Description |
+|---|---|---|
+| `audio_clipok_path` | `str` | Path to `CleanCorpus/InterviewTaskok/audio_clipok` |
+
+Returns: `dict[str, float]` — IT speaker_id → mean speech turn duration in seconds.
+
+---
+
+#### Entry point
+
+##### `main(output_csv, metadata_csv, f0_folder_paths, it_audio_clip_path)`
+
+Orchestrates the full pipeline and produces the final 10-column LMM CSV.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `output_csv` | `str` | Path to the output `.csv` file |
+| `metadata_csv` | `str` | Path to the metadata CSV used for sex lookup |
+| `f0_folder_paths` | `list[str]` | Mother folders with pre-computed per-utterance F0 stats (same structure as `verification_prep_data.py`) |
+| `it_audio_clip_path` | `str` | Path to `CleanCorpus/InterviewTaskok/audio_clipok` for speech turn duration |
+
+**Pipeline steps:**
+
+1. Build the F0 index from `f0_folder_paths` (`_build_f0_index`)
+2. Build the sex index from `metadata_csv` (`_build_metadata_index`)
+3. Build the IT speech turn duration index from `it_audio_clip_path` (`_build_duration_index`)
+4. Derive the speaker list from the F0 index keys
+5. Assemble one row per speaker and write the final CSV
+
+---
+
+### How to run the pipeline
+
+```python
+from analytical_validation_prep_data import main
+
+main(
+    output_csv="lmm_analytical_validation.csv",
+
+    # Metadata CSV with speaker sex (two-table layout: RT cols 0–6, IT cols 7–13)
+    metadata_csv="path/to/metadata.csv",
+
+    # Mother folders with pre-computed per-utterance F0 stats
+    # Must contain speaker sub-folders, each with mean/, standard_dev/, variance/
+    f0_folder_paths=[
+        "feature_extraction/AndroidsResults/F0_results/F0_yin/F0_results_IT",
+        "feature_extraction/AndroidsResults/F0_results/F0_yin/F0_results_RT",
+    ],
+
+    # IT audio clip folder — one sub-folder per patient, one .wav per speech turn
+    it_audio_clip_path="CleanCorpus/InterviewTaskok/audio_clipok",
+)
+```
+
+The output file `lmm_analytical_validation.csv` is ready to be loaded directly into R for LMM fitting.
+
+#### Expected folder structures
+
+**F0 stats folders** (same structure as `verification_prep_data.py`):
+
+```
+F0_results_IT/                                    ← mother folder (what you pass)
+├── IT_01_CF56_1_segmented/                       ← speaker folder (auto-discovered)
+│   ├── mean/
+│   │   └── IT_01_CF56_1_segmented_mean.csv       # Utterance_File, F0_Mean
+│   ├── standard_dev/
+│   │   └── IT_01_CF56_1_segmented_standard_dev.csv  # Utterance_File, F0_StdDev
+│   └── variance/
+│       └── IT_01_CF56_1_segmented_variance.csv   # Utterance_File, F0_Variance
+├── IT_02_CM57_2_segmented/
+│   └── ...
+└── ...
+```
+
+**IT audio clip folder** (speech turn duration source):
+
+```
+audio_clipok/                                     ← what you pass as it_audio_clip_path
+├── 01_CF56_1ok/                                  ← patient folder → speaker IT_01_CF56_1
+│   ├── 01_CF56_1_1ok.wav                         ← speech turn 1
+│   ├── 01_CF56_1_2ok.wav                         ← speech turn 2
+│   └── ...
+├── 01_PM58_2ok/                                  ← patient folder → speaker IT_01_PM58_2
+│   └── ...
+└── ...
+```
+
+**Metadata CSV layout** (two side-by-side tables, single file):
+
+```
+col 0        col 3   ...   col 7        col 10
+RT speaker   SEX     ...   IT speaker   SEX
+'01_CF56_1ok'  F     ...   '01_CF56_1ok'  F
+...
+```
