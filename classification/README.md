@@ -7,26 +7,23 @@ This directory contains the machine learning classification pipeline for The And
 The `logistic_regression.py` script trains, evaluates, and interprets a Logistic Regression model on the processed dataset. Its main capabilities include:
 
 1. **Data Filtering & Preprocessing**: 
-   - Filters the dataset by specific tasks (e.g., `RT` for Reading Task, `IT` for Interview Task) and noise conditions (`0` for noisy, `1` for denoised).
-   - Encodes categorical variables (Sex, Task, Speaker Group, Age Group) into numeric codes.
-2. **Optional Demographic Normalization**: 
-   - If the `--normalize_demographics` flag is used, it calculates baseline F0 statistics (mean and standard deviation) using only the healthy training subjects, grouped by `Sex` and `Age_grp`. 
-   - It then standardizes the F0 features of both the training and test sets against these baselines to minimize demographic biases. (If disabled, standard scaling is applied to the `Age` feature instead).
-3. **Model Training & Evaluation**: 
-   - Splits the data into training (80%) and testing (20%) sets.
-   - Trains a `LogisticRegression` classifier to predict the `Speaker_grp` (0 = Control, 1 = Patient).
-   - Evaluates the model using Accuracy, Precision, Recall, F1 Score, and a Confusion Matrix.
-4. **Interpretability & Feature Importance**: 
-   - Computes Feature Coefficients (Log-Odds) and Odds Ratios to show how each feature influences the probability of the positive class.
-   - Calculates Permutation Feature Importance (with 10 repeats) to measure the impact of each feature on the model's overall accuracy.
-5. **Result Logging**: 
-   - Appends all evaluation metrics, coefficients, and permutation importance scores to an output CSV file if an `--output_csv` path is provided.
+   - Filters the dataset to evaluate specific tasks (`RT` for Reading Task, `IT` for Interview Task, or `Both`).
+   - Uses raw, non-denoised audio only (`is_denoised == 0`).
+   - Keeps only the essential predictive features (`Mean_F0`, `F0_SD`, and `Task` if Both are evaluated).
+2. **Model Training & Cross-Validation**: 
+   - Uses `StratifiedKFold` cross-validation ensure Control/Patient class ratio across folds.
+   - Trains a `LogisticRegression` classifier with standard scaling to predict `Speaker_grp` (0 = Control, 1 = Patient).
+3. **Evaluation Metrics & Plotting**: 
+   - Evaluates the model using UAR (Unweighted Average Recall / Balanced Accuracy), Precision, Recall, and F1 Score.
+   - Features a `--plot` flag to generate and save a Cross-Validated ROC Curve (showing Mean AUC) and an Aggregated Confusion Matrix heatmap.
+4. **Result Logging**: 
+   - Appends aggregated evaluation metrics across all folds to an output CSV file if an `--output_csv` path is provided.
 
 ## Prerequisites
 
 - **Python 3** (3.8+ recommended)
 
-- **Python packages**: `pandas`, `numpy`, `scikit-learn`
+- **Python packages**: `pandas`, `numpy`, `scikit-learn`, `matplotlib`, `seaborn`
 
 
 ## Directory Structure
@@ -38,11 +35,6 @@ classification/
 │   ├── master_dataset_praat.csv    # Dataset of metadata and extracted F0 mean and standard dev. with parselmouth/Praat
 │   └── master_dataset_yin.csv      # Dataset of metadata and extracted F0 mean and standard dev. with pYIN
 |
-├── AndroidsResults
-│   ├── LR_egemaps.csv              # Logistic regression results for eGeMAPS features
-│   ├── LR_praat.csv                # Logistic regression results for parselmouth/Praat features
-│   └── LR_yin.csv                  # Logistic regression results for pYIN features
-|
 ├── logistic_regression.py          # Main script for training and evaluating the model
 └── README.md                    
 ```
@@ -52,7 +44,7 @@ classification/
 ### Install Python Packages
 
 ```bash
-pip install pandas numpy scikit-learn
+pip install pandas numpy scikit-learn matplotlib seaborn
 ```
 
 ### Run the Script
@@ -62,10 +54,7 @@ Run the script from the command line, providing the path to your master CSV data
 **Example command:**
 ```bash
 python classification/logistic_regression.py /path/to/<master_dataset.csv> \
-    --task RT \
-    --condition 1 \
-    --normalize_demographics \
-    --output_csv /path/to/<classification_results.csv>
+    --task RT or IT or Both \
+    --plot (optional)
+    --output_csv /path/to/<classification_results.csv> (optional)
 ```
-
-Results from the processing of the same CSV with different tasks and conditions are saved in the same output file on different lines.
